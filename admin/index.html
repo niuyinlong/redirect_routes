@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>路由重定向管理系统</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <style>
+    .container { max-width: 960px; margin-top: 40px; }
+    .route-item { margin-bottom: 10px; padding: 15px; border-radius: 5px; background-color: #f8f9fa; }
+    .route-item:hover { background-color: #e9ecef; }
+    .stats { font-size: 0.8rem; color: #6c757d; }
+    .toast-container { position: fixed; top: 20px; right: 20px; z-index: 1050; }
+    .loading-spinner {
+      display: inline-block;
+      width: 1rem;
+      height: 1rem;
+      border: 0.2em solid currentColor;
+      border-right-color: transparent;
+      border-radius: 50%;
+      animation: spinner-border 0.75s linear infinite;
+      margin-right: 0.5rem;
+    }
+    @keyframes spinner-border { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1 class="mb-4">路由重定向管理系统</h1>
+
+  <!-- 认证表单 -->
+  <div id="auth-form" class="card p-4 mb-4">
+    <h3>认证</h3>
+    <div class="mb-3">
+      <label for="api-key-input" class="form-label">API密钥</label>
+      <input type="password" class="form-control" id="api-key-input" placeholder="输入API密钥" />
+    </div>
+    <button id="auth-btn" class="btn btn-primary">
+      <span id="auth-btn-spinner" class="loading-spinner d-none"></span>
+      认证
+    </button>
+  </div>
+
+  <!-- 主内容区（隐藏状态下初始） -->
+  <div id="main-content" style="display: none;">
+    <!-- 添加新路由表单 -->
+    <div class="card p-4 mb-4">
+      <h3>添加新路由</h3>
+      <div class="mb-3">
+        <label for="original-url" class="form-label">原始URL</label>
+        <input type="url" class="form-control" id="original-url" placeholder="https://example.com/long/path" />
+      </div>
+      <div class="mb-3">
+        <label for="custom-path-input" class="form-label">自定义路径（可选）</label>
+        <input type="text" class="form-control" id="custom-path-input" placeholder="my-custom-path" />
+      </div>
+      <button id="generate-btn" class="btn btn-primary">
+        <span id="generate-btn-spinner" class="loading-spinner d-none"></span>
+        生成短链接
+      </button>
+    </div>
+
+    <!-- 路由列表区 -->
+    <div class="card p-4">
+      <h3 class="d-flex justify-content-between align-items-center">
+        <span>现有路由</span>
+        <button id="refresh-btn" class="btn btn-sm btn-outline-secondary">
+          <span id="refresh-btn-spinner" class="loading-spinner d-none"></span>
+          刷新
+        </button>
+      </h3>
+      <div class="mb-3">
+        <input type="text" class="form-control" id="search-filter-input" placeholder="搜索路径或URL" />
+      </div>
+      <div id="routes-container"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 操作结果模态框 -->
+<div class="modal fade" id="result-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">操作结果</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body" id="modal-content"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast 提示容器 -->
+<div class="toast-container"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  // 配置
+  const API_BASE_URL = 'https://s.niu.one/api';  // 改为您的 Workers API 域名
+  let apiKey = '';
+  let resultModal;
+
+  // 初始化
+  document.addEventListener('DOMContentLoaded', () => {
+    // 初始化模态框实例
+    resultModal = new bootstrap.Modal(document.getElementById('result-modal'));
+    // 绑定按钮事件
+    document.getElementById('auth-btn').addEventListener('click', authenticate);
+    document.getElementById('generate-btn').addEventListener('click', generateShortLink);
+    document.getElementById('search-filter-input').addEventListener('input', filterRoutes);
+    document.getElementById('refresh-btn').addEventListener('click', loadRoutes);
+    // 如本地存储有 API 密钥则自动填入并尝试认证
+    const savedApiKey = localStorage.getItem('redirect_api_key');
+    if (savedApiKey) {
+      document.getElementById('api-key-input').value = savedApiKey;
+      authenticate();
+    }
+  });
+
+  // 设置按钮加载状态
+  function setLoading(elementId, isLoading) {
+    const button = document.getElementById(elementId);
+    const spinner = document.getElementById(`${elementId}-spinner`);
+    if (!button || !spinner) return;  // 防御：元素可能不存在
+    if (isLoading) {
+      button.disabled = true;
+      spinner.classList.remove('d-none');
+    } else {
+      button.disabled = false;
+      spinner.classList.add('d-none');
+    }
+  }
+
+  // 显示提示消息（Toast）
+  function showToast(message, type = 'success') {
+    const toastContainer = document.querySelector('.toast-container');
+    const toastElement = document.createElement('div');
+    toastElement.className = `toast align-items-center text-white bg-${type} border-0`;
+    toastElement.setAttribute('role', 'alert');
+    toastElement.setAttribute('aria-live', 'assertive');
+    toastElement.setAttribute('aria-atomic', 'true');
+    toastElement.innerHTML = `
+      <div class="d-flex">
+        <div class="toast-body">${message}</div>
+        <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+      </div>
+    `;
+    toastContainer.appendChild(toastElement);
+    const toast = new bootstrap.Toast(toastElement, { delay: 3000 });
+    toast.show();
+    // 移除 DOM 中的 toast 元素
+    toastElement.addEventListener('hidden.bs.toast', () => {
+      toastElement.remove();
+    });
+  }
+
+  // 显示模态框
+  function showModal(title, content) {
+    document.querySelector('.modal-title').textContent = title;
+    document.getElementById('modal-content').innerHTML = content;
+    resultModal.show();
+  }
+
+  // 执行认证
+  async function authenticate() {
+    apiKey = document.getElementById('api-key-input').value.trim();
+    if (!apiKey) {
+      showModal('错误', '请输入API密钥');
+      return;
+    }
+    setLoading('auth-btn', true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/routes`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+      if (response.ok) {
+        // 认证成功，保存密钥并显示主界面
+        localStorage.setItem('redirect_api_key', apiKey);
+        document.getElementById('auth-form').style.display = 'none';
+        document.getElementById('main-content').style.display = 'block';
+        showToast('认证成功');
+        loadRoutes();
+      } else {
+        // 认证失败，清除本地保存的密钥并提示
+        localStorage.removeItem('redirect_api_key');
+        document.getElementById('api-key-input').value = '';
+        showModal('认证失败', '无效的API密钥');
+      }
+    } catch (err) {
+      showModal('错误', `请求失败: ${err.message}`);
+    } finally {
+      setLoading('auth-btn', false);
+    }
+  }
+
+  // 登出（清除状态并显示认证表单）
+  function logout() {
+    localStorage.removeItem('redirect_api_key');
+    document.getElementById('main-content').style.display = 'none';
+    document.getElementById('auth-form').style.display = 'block';
+    document.getElementById('api-key-input').value = '';
+    document.getElementById('routes-container').innerHTML = '';
+    apiKey = '';
+    showToast('已退出登录');
+  }
+
+  // 加载路由列表
+  async function loadRoutes() {
+    setLoading('refresh-btn', true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/routes`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        displayRoutes(data.routes);
+        showToast('路由列表已更新');
+      } else if (response.status === 401) {
+        // API 密钥失效处理
+        showModal('错误', 'API密钥已失效，请重新认证');
+        logout();
+      } else {
+        showModal('错误', '加载路由失败');
+      }
+    } catch (err) {
+      showModal('错误', `请求失败: ${err.message}`);
+    } finally {
+      setLoading('refresh-btn', false);
+    }
+  }
+
+  // 将路由数据显示在列表
+  function displayRoutes(routes) {
+    const container = document.getElementById('routes-container');
+    container.innerHTML = '';
+    if (!routes || Object.keys(routes).length === 0) {
+      container.innerHTML = '<div class="alert alert-info">暂无路由</div>';
+      return;
+    }
+    // 将对象转换为数组并按路径排序
+    const routesArray = Object.entries(routes).map(([path, url]) => ({ path, url }));
+    routesArray.sort((a, b) => a.path.localeCompare(b.path));
+    // 动态创建路由项 DOM
+    for (const { path, url } of routesArray) {
+      const routeElement = document.createElement('div');
+      routeElement.className = 'route-item';
+      routeElement.setAttribute('data-path', path);
+      routeElement.setAttribute('data-url', url);
+      routeElement.innerHTML = `
+        <div class="d-flex justify-content-between align-items-center">
+          <div>
+            <h5 class="mb-1">${path}</h5>
+            <p class="mb-1">
+              <a href="${url}" target="_blank" title="${url}">${truncateUrl(url, 50)}</a>
+            </p>
+            <div class="stats">
+              <span class="clicks-count">加载中...</span>
+            </div>
+          </div>
+          <div>
+            <button class="btn btn-sm btn-outline-primary copy-btn" data-path="${path}">复制短链接</button>
+            <button class="btn btn-sm btn-outline-secondary edit-btn" data-path="${path}" data-url="${url}">编辑</button>
+            <button class="btn btn-sm btn-outline-danger delete-btn" data-path="${path}">删除</button>
+          </div>
+        </div>
+      `;
+      container.appendChild(routeElement);
+      // 加载每条路由的点击统计
+      loadRouteStats(path);
+      // 绑定每条路由项的操作事件
+      routeElement.querySelector('.copy-btn').addEventListener('click', () => {
+        copyToClipboard(`${window.location.protocol}//${window.location.host.replace('admin.', '')}/${path}`);
+      });
+      routeElement.querySelector('.edit-btn').addEventListener('click', () => {
+        editRoute(path, url);
+      });
+      routeElement.querySelector('.delete-btn').addEventListener('click', () => {
+        deleteRoute(path);
+      });
+    }
+  }
+
+  // 截断长URL用于显示
+  function truncateUrl(url, maxLength) {
+    if (url.length <= maxLength) return url;
+    return url.substring(0, maxLength - 3) + '...';
+  }
+
+  // 加载单条路由的统计信息
+  async function loadRouteStats(path) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/route/${path}`, {
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+      if (response.ok) {
+        const data = await response.json();
+        const statsElement = document.querySelector(`[data-path="${path}"] .clicks-count`);
+        if (statsElement) {
+          statsElement.textContent = `点击量: ${data.clicks || 0}`;
+          if (data.lastClicked) {
+            statsElement.textContent += ` | 最后点击: ${new Date(data.lastClicked).toLocaleString()}`;
+          }
+        }
+      }
+    } catch (err) {
+      console.error(`加载路由统计失败: ${err.message}`);
+    }
+  }
+
+  // 生成短链接
+  async function generateShortLink() {
+    const originalUrl = document.getElementById('original-url').value.trim();
+    const customPath = document.getElementById('custom-path-input').value.trim();
+    if (!originalUrl) {
+      showModal('错误', '请输入原始URL');
+      return;
+    }
+    setLoading('generate-btn', true);
+    try {
+      const response = await fetch(`${API_BASE_URL}/route`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          url: originalUrl,
+          customPath: customPath || undefined
+        })
+      });
+      const data = await response.json();
+      if (response.ok) {
+        // 短链接创建成功
+        document.getElementById('original-url').value = '';
+        document.getElementById('custom-path-input').value = '';
+        const shortUrl = `${window.location.protocol}//${window.location.host.replace('admin.', '')}/${data.path}`;
+        showModal('成功', `
+          <p>短链接已生成:</p>
+          <div class="input-group mb-3">
+            <input type="text" class="form-control" value="${shortUrl}" readonly>
+            <button class="btn btn-outline-secondary copy-modal-btn" type="button">复制</button>
+          </div>
+        `);
+        // 绑定复制按钮事件
+        document.querySelector('.copy-modal-btn').addEventListener('click', () => {
+          copyToClipboard(shortUrl);
+        });
+        showToast('短链接已生成');
+        loadRoutes();
+      } else if (response.status === 401) {
+        showModal('错误', 'API密钥已失效，请重新认证');
+        logout();
+      } else {
+        showModal('错误', data.error || '生成短链接失败');
+      }
+    } catch (err) {
+      showModal('错误', `请求失败: ${err.message}`);
+    } finally {
+      setLoading('generate-btn', false);
+    }
+  }
+
+  // 编辑路由
+  function editRoute(path, currentUrl) {
+    // 显示编辑模态框，包含表单
+    showModal('编辑路由', `
+      <form id="edit-route-form">
+        <div class="mb-3">
+          <label for="edit-path" class="form-label">路径</label>
+          <input type="text" class="form-control" id="edit-path" value="${path}" readonly>
+        </div>
+        <div class="mb-3">
+          <label for="edit-url" class="form-label">目标URL</label>
+          <input type="url" class="form-control" id="edit-url" value="${currentUrl}" required>
+        </div>
+        <button type="submit" class="btn btn-primary" id="edit-save-btn">
+          <span id="edit-save-btn-spinner" class="loading-spinner d-none"></span>
+          保存
+        </button>
+      </form>
+    `);
+    // 绑定编辑表单提交事件
+    document.getElementById('edit-route-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const newUrl = document.getElementById('edit-url').value.trim();
+      if (!newUrl) {
+        showModal('错误', '请输入目标URL');
+        return;
+      }
+      setLoading('edit-save-btn', true);
+      try {
+        const response = await fetch(`${API_BASE_URL}/route/${path}`, {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({ url: newUrl })
+        });
+        if (response.ok) {
+          resultModal.hide();  // 关闭编辑模态框
+          showToast(`路由 "${path}" 已更新`);
+          loadRoutes();
+        } else if (response.status === 401) {
+          showModal('错误', 'API密钥已失效，请重新认证');
+          logout();
+        } else {
+          const data = await response.json();
+          showModal('错误', data.error || '更新路由失败');
+        }
+      } catch (err) {
+        showModal('错误', `请求失败: ${err.message}`);
+      } finally {
+        setLoading('edit-save-btn', false);
+      }
+    });
+  }
+
+  // 删除路由
+  async function deleteRoute(path) {
+    if (!confirm(`确定要删除路由 "${path}" 吗？`)) {
+      return;
+    }
+    const deleteBtn = document.querySelector(`.delete-btn[data-path="${path}"]`);
+    if (deleteBtn) {
+      deleteBtn.disabled = true;
+      deleteBtn.innerHTML = '<span class="loading-spinner"></span> 删除中...';
+    }
+    let response;
+    try {
+      response = await fetch(`${API_BASE_URL}/route/${path}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${apiKey}` }
+      });
+      if (response.ok) {
+        const routeElement = document.querySelector(`[data-path="${path}"]`);
+        if (routeElement) routeElement.remove();
+        if (document.getElementById('routes-container').children.length === 0) {
+          document.getElementById('routes-container').innerHTML = '<div class="alert alert-info">暂无路由</div>';
+        }
+        showToast(`路由 "${path}" 已删除`, 'danger');
+      } else if (response.status === 401) {
+        showModal('错误', 'API密钥已失效，请重新认证');
+        logout();
+      } else {
+        const data = await response.json();
+        showModal('错误', data.error || '删除路由失败');
+      }
+    } catch (err) {
+      showModal('错误', `请求失败: ${err.message}`);
+    } finally {
+      if (deleteBtn && (!response || !response.ok)) {
+        // 未成功删除，则恢复删除按钮状态
+        if (response && response.status === 401) {
+          // 未授权情况下已执行logout，按钮容器已清空，无需恢复
+        } else {
+          deleteBtn.disabled = false;
+          deleteBtn.textContent = '删除';
+        }
+      }
+    }
+  }
+
+  // 过滤路由列表
+  function filterRoutes() {
+    const searchText = document.getElementById('search-filter-input').value.toLowerCase();
+    document.querySelectorAll('.route-item').forEach(item => {
+      const path = item.getAttribute('data-path').toLowerCase();
+      const url = item.getAttribute('data-url').toLowerCase();
+      item.style.display = (path.includes(searchText) || url.includes(searchText)) ? 'block' : 'none';
+    });
+  }
+
+  // 复制文本到剪贴板
+  function copyToClipboard(text) {
+    navigator.clipboard.writeText(text).then(() => {
+      showToast('已复制到剪贴板');
+    }).catch(err => {
+      console.error('复制失败:', err);
+      showToast('复制失败，请手动复制', 'danger');
+    });
+  }
+</script>
+</body>
+</html>
